@@ -1,0 +1,409 @@
+---
+title: "Raw Milk Survey Analysis - 03: Outcome 2, Exclusive Raw Milk Consumption"
+output: html_document
+---
+
+Model R_Exclusive: predictors of **exclusive** raw milk consumption
+(`raw_only_binary`), among the same N = 898 analytic sample used in 02.
+
+Run `01_data_cleaning.Rmd` first so `cleaned_survey_data.csv` exists in the
+working directory.
+
+The analytic dataset is built the same way as `data_final` in 02, so the two
+outcomes share category definitions and reference levels exactly. The only
+difference is the outcome: here, exclusive raw consumers (n = 58) versus
+everyone else (n = 840).
+
+Reference categories:
+
+| Variable | Reference |
+|---|---|
+| Age group | 18–24 |
+| Sex at birth | Female |
+| Region | Midwest |
+| Cohabitation with high-risk consumer | No at-risk member |
+| Perceived taste | Equal |
+| Nutrition beliefs | Equal |
+| Perceived illness risk | Equal risk |
+| H5N1 safety concern | No |
+| Trusted information source | Doctors or nurses |
+| Education | High school or less |
+| Political orientation | Democrat |
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(broom)
+library(gt)
+library(pROC)
+library(ResourceSelection)
+
+survey_grouped <- read_csv("cleaned_survey_data.csv", show_col_types = FALSE)
+```
+
+## 1. Analytic dataset
+
+Same construction as 02. Two things that are easy to break:
+
+- `raw_milk_sickness` is renamed BEFORE the `across()` runs; that block treats
+  "They are equal" as non-definitive, which would otherwise absorb a
+  substantive response category for illness risk.
+- Education and political orientation are restored to NA afterwards, so
+  declining those questions is treated as missingness rather than becoming the
+  reference level.
+
+```{r data-rb}
+predictors_miss <- c(
+  "milk_safety_concern", "raw_milk_sickness", "taste_grouped2",
+  "nutrition_grouped2", "household_risk_group", "age_grouped",
+  "sex_at_birth", "region", "info_source", "education_grouped",
+  "politics_grouped"
+)
+
+data_rb <- survey_grouped %>%
+  mutate(raw_only_binary = case_when(
+    milk_consumed == "Raw dairy milk" ~ 1,
+    milk_consumed %in% c("Pasteurized dairy milk",
+                         "Both raw and pasteurized dairy milk") ~ 0,
+    TRUE ~ NA_real_)) %>%
+  filter(!is.na(raw_only_binary)) %>%
+  mutate(raw_milk_sickness = if_else(raw_milk_sickness == "They are equal",
+                                     "Equal risk", as.character(raw_milk_sickness))) %>%
+  mutate(across(all_of(predictors_miss), ~ {
+    val <- as.character(.)
+    non_definitive <- is.na(val) |
+      val %in% c("I don’t know", "I don't know", "Prefer not to answer",
+                 "They are equal", "Missing", "")
+    val[non_definitive] <- "Uncertain/Missing"
+    factor(val)
+  })) %>%
+  mutate(across(c(education_grouped, politics_grouped),
+                ~ factor(na_if(as.character(.), "Uncertain/Missing")))) %>%
+  mutate(
+    # Respondents who declined Q4 join the reference group, matching 02
+    household_risk_group = fct_collapse(factor(household_risk_group),
+      "No at-risk member" = c("No at-risk member", "Uncertain/Missing")),
+    household_risk_group = fct_relevel(household_risk_group, "No at-risk member"),
+    taste_grouped2       = fct_relevel(factor(taste_grouped2),       "Equal"),
+    nutrition_grouped2   = fct_relevel(factor(nutrition_grouped2),   "Equal"),
+    raw_milk_sickness    = fct_relevel(factor(raw_milk_sickness),    "Equal risk"),
+    milk_safety_concern  = fct_relevel(factor(milk_safety_concern),  "No"),
+    age_grouped          = fct_relevel(factor(age_grouped),          "18–24"),
+    sex_at_birth         = fct_relevel(factor(sex_at_birth),         "Female"),
+    region               = fct_relevel(factor(region),               "Midwest"),
+    info_source          = fct_relevel(factor(info_source),          "Doctors or nurses"),
+    education_grouped    = fct_relevel(factor(education_grouped),    "High school or less"),
+    politics_grouped     = fct_relevel(factor(politics_grouped),     "Democrat"),
+    outcome = factor(raw_only_binary, labels = c("Not Exclusive", "Exclusive Raw"))
+  )
+
+cat("Analytic sample:", nrow(data_rb), "\n")
+cat("Exclusive raw consumers:", sum(data_rb$raw_only_binary), "\n\n")
+cat("Reference level per predictor:\n")
+for (v in predictors_miss) cat(" ", v, "->", levels(data_rb[[v]])[1], "\n")
+```
+
+## 2. Univariable analysis
+
+Education and political orientation have smaller denominators because
+respondents who declined those questions are excluded.
+
+```{r univariable}
+uv_vars <- c(
+  age_grouped          = "Age Group",
+  sex_at_birth         = "Sex at Birth",
+  region               = "Geographic Region",
+  taste_grouped2       = "Perceived Taste",
+  nutrition_grouped2   = "Nutrition Beliefs",
+  raw_milk_sickness    = "Perceived Illness Risk (Q7)",
+  milk_safety_concern  = "H5N1 Safety Concern (Q8)",
+  info_source          = "Trusted Information Source (Q3)",
+  household_risk_group = "Cohabitation with High-Risk Consumer",
+  education_grouped    = "Education Level",
+  politics_grouped     = "Political Orientation"
+)
+
+make_uv_rb <- function(var) {
+  d <- data_rb %>% filter(!is.na(.data[[var]])) %>% droplevels()
+
+  tab  <- table(d[[var]], d$outcome)
+  desc <- as.data.frame.matrix(tab)
+  desc$total <- rowSums(desc)
+  desc <- desc %>%
+    mutate(Level   = rownames(desc),
+           No_n    = `Not Exclusive`,
+           No_pct  = round(100 * `Not Exclusive` / total, 1),
+           Yes_n   = `Exclusive Raw`,
+           Yes_pct = round(100 * `Exclusive Raw` / total, 1)) %>%
+    select(Level, No_n, No_pct, Yes_n, Yes_pct)
+
+  m <- glm(as.formula(paste("outcome ~", var)), data = d, family = binomial)
+
+  est <- tidy(m, exponentiate = TRUE, conf.int = TRUE) %>%
+    filter(term != "(Intercept)") %>%
+    mutate(Level = trimws(gsub(var, "", term))) %>%
+    select(Level, OR = estimate, CI_low = conf.low, CI_high = conf.high, p = p.value)
+
+  left_join(desc, est, by = "Level") %>%
+    mutate(variable = sprintf("%s (n = %d)", uv_vars[[var]], sum(tab)),
+           var_raw  = var,
+           Level    = factor(Level, levels = levels(d[[var]]))) %>%
+    arrange(Level) %>%
+    mutate(Level = as.character(Level))
+}
+
+uv_rb <- bind_rows(lapply(names(uv_vars), make_uv_rb)) %>%
+  filter(No_n + Yes_n > 0) %>%
+  mutate(
+    # Complete separation gives uninterpretable estimates; suppress rather than print
+    estimable = !is.na(OR) & OR < 1000 & OR > 0.001 & !is.na(CI_low) & !is.na(CI_high),
+    OR_CI = case_when(is.na(OR)  ~ "1.00 (Reference)",
+                      !estimable ~ "Not estimable",
+                      TRUE ~ sprintf("%.2f (%.2f–%.2f)", OR, CI_low, CI_high)),
+    p_fmt = case_when(is.na(p)   ~ "—",
+                      !estimable ~ "—",
+                      p < 0.001  ~ "<0.001",
+                      TRUE       ~ sprintf("%.3f", p)),
+    Sig = !is.na(p) & estimable & p < 0.05,
+    Level = Level %>%
+      gsub("^No at-risk member$",  "No",  .) %>%
+      gsub("^Has at-risk member$", "Yes", .)
+  )
+
+write_csv(uv_rb, "Univariable_Exclusive_Consumption.csv")
+
+uv_rb %>%
+  select(variable, Level, No_n, No_pct, Yes_n, Yes_pct, OR_CI, p_fmt, Sig) %>%
+  gt(groupname_col = "variable") %>%
+  tab_header(title = "Univariable Logistic Regression: Exclusive Raw Milk Consumption",
+             subtitle = paste0("Analytic sample (N = ", nrow(data_rb), ")")) %>%
+  cols_label(Level = "Response Category",
+             No_n = "n", No_pct = "%", Yes_n = "n", Yes_pct = "%",
+             OR_CI = "Odds Ratio (95% CI)", p_fmt = "p-value") %>%
+  tab_spanner(label = "Not exclusively raw", columns = c(No_n, No_pct)) %>%
+  tab_spanner(label = "Exclusively raw",     columns = c(Yes_n, Yes_pct)) %>%
+  tab_style(style = cell_text(weight = "bold"),
+            locations = cells_body(columns = p_fmt, rows = Sig == TRUE)) %>%
+  cols_hide(Sig) %>%
+  tab_options(table.font.size = "13px", row_group.background.color = "#F9F9F9",
+              data_row.padding = px(4), table.width = pct(100)) %>%
+  cols_align(align = "center", columns = c(No_n, No_pct, Yes_n, Yes_pct, p_fmt)) %>%
+  tab_source_note(paste(
+    "Reference categories listed first within each variable.",
+    "Education and political orientation exclude respondents who declined to answer."))
+```
+
+```{r uv-screening}
+screening <- uv_rb %>%
+  group_by(variable, var_raw) %>%
+  summarise(min_p = suppressWarnings(min(p[estimable], na.rm = TRUE)), .groups = "drop") %>%
+  mutate(carry_forward = ifelse(min_p < 0.10, "Yes", "No")) %>%
+  arrange(min_p)
+
+screening %>%
+  mutate(min_p = sprintf("%.4f", min_p)) %>%
+  select(variable, min_p, carry_forward) %>%
+  gt() %>%
+  tab_header(title = "Univariable Screening (p < 0.10)",
+             subtitle = "Predictors carried forward to forward stepwise selection") %>%
+  cols_label(variable = "Predictor", min_p = "Smallest p",
+             carry_forward = "Carried forward")
+
+candidate_pool <- screening$var_raw[screening$carry_forward == "Yes"]
+cat("Candidate pool:", paste(candidate_pool, collapse = ", "), "\n")
+```
+
+## 3. Forward stepwise selection
+
+```{r stepwise}
+get_aic_candidates <- function(base_formula, predictors, data) {
+  base_aic <- AIC(glm(as.formula(base_formula), data = data, family = binomial))
+  tab <- lapply(predictors, function(p) {
+    m <- glm(as.formula(paste(base_formula, "+", p)), data = data, family = binomial)
+    data.frame(Predictor = p, AIC = AIC(m))
+  }) %>% bind_rows() %>% arrange(AIC)
+  list(base_aic = base_aic, aic_table = tab)
+}
+
+selected <- character(0)
+step_num <- 1
+repeat {
+  base_f <- paste("raw_only_binary ~",
+                  if (length(selected) == 0) "1" else paste(selected, collapse = " + "))
+  remaining <- setdiff(candidate_pool, selected)
+  if (length(remaining) == 0) break
+
+  res <- get_aic_candidates(base_f, remaining, data_rb)
+  cat("\n=== Step", step_num, "=== base AIC:", round(res$base_aic, 2), "\n")
+  print(res$aic_table)
+
+  if (res$base_aic - res$aic_table$AIC[1] < 2) {
+    cat("\nNo further improvement >= 2 AIC units. Selection complete.\n")
+    break
+  }
+  selected <- c(selected, res$aic_table$Predictor[1])
+  step_num <- step_num + 1
+}
+
+cat("\nSelected predictors:", paste(selected, collapse = ", "), "\n")
+```
+
+## 4. Final multivariable model
+
+```{r final-model}
+final_model_rawonly <- glm(
+  as.formula(paste("raw_only_binary ~", paste(selected, collapse = " + "))),
+  data = data_rb, family = binomial
+)
+
+cat("Complete cases in final model:", length(final_model_rawonly$y),
+    "of", nrow(data_rb), "\n")
+
+final_table_rb <- tidy(final_model_rawonly, exponentiate = TRUE, conf.int = TRUE) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(
+    term = term %>%
+      str_replace("taste_grouped2",       "Taste: ") %>%
+      str_replace("nutrition_grouped2",   "Nutrition: ") %>%
+      str_replace("age_grouped",          "Age: ") %>%
+      str_replace("household_risk_group", "Cohabitation: ") %>%
+      str_replace("milk_safety_concern",  "H5N1 Concern: ") %>%
+      str_replace("raw_milk_sickness",    "Illness Risk: "),
+    aOR_CI = sprintf("%.2f (%.2f–%.2f)", estimate, conf.low, conf.high),
+    p_fmt  = ifelse(p.value < 0.001, "<0.001", sprintf("%.3f", p.value))
+  )
+
+write_csv(final_table_rb, "Table_4_Multivariable_RExclusive_Final.csv")
+
+final_table_rb %>%
+  select(term, aOR_CI, p_fmt) %>%
+  gt() %>%
+  tab_header(title = "Multivariable Predictors of Exclusive Raw Milk Consumption",
+             subtitle = paste0("Adjusted odds ratios (N = ",
+                               length(final_model_rawonly$y), ")")) %>%
+  cols_label(term = "Variable & Category", aOR_CI = "aOR (95% CI)", p_fmt = "p-value") %>%
+  tab_source_note(paste(
+    "References: Age 18–24, Equal taste preference,",
+    "and no at-risk household member."))
+```
+
+## 5. Diagnostics
+
+```{r diagnostics}
+roc_rb <- roc(final_model_rawonly$y, fitted(final_model_rawonly), quiet = TRUE)
+hl_rb  <- hoslem.test(final_model_rawonly$y, fitted(final_model_rawonly), g = 10)
+
+cat("AUC:", round(as.numeric(auc(roc_rb)), 4), "\n")
+cat("Hosmer-Lemeshow X2:", round(as.numeric(hl_rb$statistic), 3),
+    " df:", as.numeric(hl_rb$parameter),
+    " p:", round(hl_rb$p.value, 4), "\n")
+
+ggplot(data.frame(fpr = 1 - roc_rb$specificities, tpr = roc_rb$sensitivities),
+       aes(x = fpr, y = tpr)) +
+  geom_path(color = "#2c3e50", linewidth = 1.2) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "red") +
+  coord_equal() +
+  theme_minimal() +
+  labs(title = paste0("Model R_Exclusive ROC (AUC = ",
+                      round(as.numeric(auc(roc_rb)), 3), ")"),
+       x = "False positive rate (1 - specificity)",
+       y = "True positive rate (sensitivity)")
+```
+
+Hosmer-Lemeshow may report fewer than `g - 2` degrees of freedom when the model
+produces few distinct fitted probabilities; R merges bins and warns. That is
+expected here and not an error.
+
+## 6. Figure 2: forest plot
+
+Built from `final_model_rawonly`, so it tracks whatever the stepwise selects.
+`clean_level()` affects display labels only.
+
+```{r forest-plot, fig.width=12, fig.height=7}
+var_labels_rb <- c(
+  taste_grouped2       = "Perceived Taste",
+  age_grouped          = "Age Group",
+  household_risk_group = "Cohabitation with\nHigh-Risk Consumer",
+  nutrition_grouped2   = "Nutrition Beliefs",
+  milk_safety_concern  = "H5N1 Safety Concern",
+  raw_milk_sickness    = "Perceived Illness Risk"
+)
+# Keep only the predictors the model actually selected, in label order
+model_vars_rb <- intersect(names(var_labels_rb), selected)
+var_labels_rb <- var_labels_rb[model_vars_rb]
+
+clean_level <- function(x) {
+  x <- gsub("Yes, if consuming either raw or pasteurized milk", "Yes, raw or pasteurized", x, fixed = TRUE)
+  x <- gsub("Yes, if consuming pasteurized milk", "Yes, pasteurized only", x, fixed = TRUE)
+  x <- gsub("Yes, if consuming raw milk",         "Yes, raw only",         x, fixed = TRUE)
+  x <- gsub("Uncertain/Missing",  "Uncertain/No Response", x, fixed = TRUE)
+  x <- gsub("No at-risk member",  "No",  x, fixed = TRUE)
+  x <- gsub("Has at-risk member", "Yes", x, fixed = TRUE)
+  x
+}
+
+est_rb <- tidy(final_model_rawonly, exponentiate = TRUE, conf.int = TRUE) %>%
+  filter(term != "(Intercept)") %>%
+  rowwise() %>%
+  mutate(var   = model_vars_rb[which(startsWith(term, model_vars_rb))][1],
+         Level = sub(paste0("^", var), "", term)) %>%
+  ungroup() %>%
+  transmute(Variable = unname(var_labels_rb[var]), Level = clean_level(Level),
+            aOR = estimate, Lower = conf.low, Upper = conf.high,
+            p_value = p.value, is_ref = FALSE, var)
+
+ref_rb <- lapply(model_vars_rb, function(v) {
+  data.frame(Variable = unname(var_labels_rb[v]),
+             Level = paste0(clean_level(levels(data_rb[[v]])[1]), " (ref)"),
+             aOR = 1, Lower = NA_real_, Upper = NA_real_,
+             p_value = NA_real_, is_ref = TRUE, var = v)
+}) %>% bind_rows()
+
+fd_rb <- bind_rows(ref_rb, est_rb) %>%
+  mutate(var = factor(var, levels = model_vars_rb)) %>%
+  arrange(var, is_ref == FALSE) %>%
+  mutate(Significance = case_when(
+           is_ref ~ "Reference",
+           !is.na(p_value) & p_value < 0.05 ~ "p < 0.05",
+           TRUE ~ "Not Significant"),
+         Unique_Row = factor(paste(Variable, Level, sep = " - "),
+                             levels = rev(paste(Variable, Level, sep = " - "))))
+
+gg_rb <- ggplot(fd_rb, aes(x = aOR, y = Unique_Row)) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "gray50", linewidth = 0.6) +
+  geom_errorbarh(data = filter(fd_rb, !is_ref),
+                 aes(xmin = Lower, xmax = Upper, color = Significance),
+                 height = 0.3, linewidth = 0.8) +
+  geom_point(aes(color = Significance, shape = Significance), size = 3.5) +
+  scale_x_log10(breaks = c(0.02, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 20),
+                labels = c("0.02","0.05","0.1","0.25","0.5","1.0","2.5","5.0","10.0","20.0"),
+                expand = expansion(mult = c(0.05, 0.1))) +
+  scale_y_discrete(labels = setNames(fd_rb$Level, fd_rb$Unique_Row)) +
+  facet_grid(Variable ~ ., scales = "free_y", space = "free_y", switch = "y") +
+  scale_color_manual(values = c("Reference" = "black", "p < 0.05" = "darkblue",
+                                "Not Significant" = "gray60")) +
+  scale_shape_manual(values = c("Reference" = 18, "p < 0.05" = 16,
+                                "Not Significant" = 16)) +
+  labs(x = "Adjusted Odds Ratio (aOR) on Log Scale (95% CI)", y = NULL,
+       title = expression(bold("Multivariable Predictors of "*R[Exclusive])),
+       color = "Statistical Significance", shape = "Statistical Significance") +
+  theme_bw(base_size = 12, base_family = "Times New Roman") +
+  theme(
+    panel.spacing     = unit(1.0, "lines"),
+    strip.placement   = "outside",
+    strip.text.y.left = element_text(angle = 0, face = "bold", hjust = 1, size = 11,
+                                     family = "Times New Roman", lineheight = 0.9),
+    strip.background  = element_blank(),
+    axis.text.y  = element_text(size = 10, family = "Times New Roman",
+                                margin = margin(r = 4)),
+    axis.text.x  = element_text(size = 10, family = "Times New Roman"),
+    axis.title.x = element_text(size = 11, family = "Times New Roman",
+                                margin = margin(t = 8)),
+    plot.title   = element_text(size = 14, hjust = 0.5, margin = margin(b = 12)),
+    legend.position = "bottom",
+    legend.text  = element_text(size = 11, family = "Times New Roman"),
+    legend.title = element_text(size = 11, family = "Times New Roman"),
+    plot.margin  = margin(t = 15, r = 50, b = 10, l = 10, unit = "pt"))
+
+ggsave("GroupB_Forest_Plot.png", plot = gg_rb, width = 12, height = 7, dpi = 300)
+print(gg_rb)
+```

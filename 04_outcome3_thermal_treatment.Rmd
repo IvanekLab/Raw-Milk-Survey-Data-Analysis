@@ -1,0 +1,571 @@
+---
+title: "Raw Milk Survey Analysis - 04: Outcome 3, At-Home Thermal Treatment"
+output: html_document
+---
+
+Secondary outcome: predictors of at-home thermal treatment of raw milk (Q2),
+among raw milk consumers only.
+
+Run `01_data_cleaning.Rmd` first so `cleaned_survey_data.csv` exists in the
+working directory.
+
+Two samples:
+
+- **Model T_Any** — all raw milk consumers (n = 164: 58 exclusive + 106 mixed)
+- **Model T_Exclusive** — exclusive raw milk consumers only (n = 58)
+
+Analytic sequence: the five-level heating response is tested first (Fisher's
+exact with Benjamini-Hochberg correction across the 11 predictors), then the
+outcome is dichotomized at "more than half the time", screened univariably at
+p < 0.10, and carried into forward stepwise AIC selection. Finally the
+dichotomization is varied to check robustness.
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(broom)
+library(gt)
+library(pROC)
+library(ResourceSelection)
+
+survey_grouped <- read_csv("cleaned_survey_data.csv", show_col_types = FALSE)
+```
+
+## 1. Sample construction
+
+`lv` fixes the category order for every predictor; the FIRST level is the
+reference. Defining all recodes and levels in one place is what keeps this file
+consistent with 02 and 03.
+
+Note the thermal analysis uses its own information-source grouping
+(`info_source_grouped`), which folds "Healer, chiropractor, naturopath" and
+"Other [specify]" into a single "Other" category because of small cell counts.
+
+```{r samples}
+lv <- list(
+  age_grouped            = c("18–24", "25–34", "35–44", "45–54", "55+"),
+  sex_at_birth           = c("Female", "Male"),
+  region                 = c("Midwest", "Northeast", "South", "West"),
+  education_grouped      = c("High school or less", "Some college or technical",
+                             "College graduate", "Graduate or professional"),
+  politics_grouped       = c("Democrat", "Independent/Other", "Republican"),
+  household_risk_group   = c("Not cohabiting", "Cohabiting"),
+  taste_grouped          = c("Equal", "Pasteurized better", "Raw better", "Uncertain/Missing"),
+  nutrition_belief_group = c("Equal", "Pasteurized better", "Raw better", "Uncertain/Missing"),
+  raw_milk_sickness      = c("Equal risk", "Pasteurized milk", "Raw milk", "Uncertain/Missing"),
+  milk_safety_concern    = c("No", "Yes, if consuming raw milk",
+                             "Yes, if consuming pasteurized milk",
+                             "Yes, if consuming either raw or pasteurized milk",
+                             "Uncertain/Missing"),
+  info_source_grouped    = c("Doctors or nurses", "Farmers", "Friends or family",
+                             "Government officials", "Professors or researchers",
+                             "Social media influencers", "Other")
+)
+
+survey_with_groups <- survey_grouped %>%
+  mutate(
+    taste_grouped = case_when(
+      raw_milk_taste == "Raw is better"         ~ "Raw better",
+      raw_milk_taste == "Pasteurized is better" ~ "Pasteurized better",
+      raw_milk_taste == "They are equal"        ~ "Equal",
+      TRUE                                      ~ "Uncertain/Missing"),
+    nutrition_belief_group = case_when(
+      raw_milk_nutrition == "Raw is better"         ~ "Raw better",
+      raw_milk_nutrition == "Pasteurized is better" ~ "Pasteurized better",
+      raw_milk_nutrition == "They are equal"        ~ "Equal",
+      TRUE                                          ~ "Uncertain/Missing"),
+    raw_milk_sickness = case_when(
+      raw_milk_sickness == "They are equal"                    ~ "Equal risk",
+      raw_milk_sickness %in% c("Raw milk", "Pasteurized milk") ~ as.character(raw_milk_sickness),
+      TRUE                                                     ~ "Uncertain/Missing"),
+    milk_safety_concern = if_else(
+      milk_safety_concern %in% lv$milk_safety_concern[1:4],
+      as.character(milk_safety_concern), "Uncertain/Missing",
+      missing = "Uncertain/Missing"),
+    info_source_grouped = case_when(
+      info_source %in% lv$info_source_grouped[1:6] ~ as.character(info_source),
+      info_source %in% c("Healer, chiropractor, naturopath", "Other [specify]") ~ "Other",
+      TRUE ~ NA_character_),
+    # Respondents who declined Q4 join the reference group, matching 02 and 03
+    household_risk_group = if_else(household_risk_group == "Has at-risk member",
+                                   "Cohabiting", "Not cohabiting",
+                                   missing = "Not cohabiting")
+  )
+
+for (v in names(lv)) {
+  survey_with_groups[[v]] <- factor(survey_with_groups[[v]], levels = lv[[v]])
+}
+
+data_T_Ronly <- survey_with_groups %>%
+  filter(milk_consumed == "Raw dairy milk", !is.na(heating_binary))
+
+data_T_RRP <- survey_with_groups %>%
+  filter(milk_consumed %in% c("Raw dairy milk", "Both raw and pasteurized dairy milk"),
+         !is.na(heating_binary))
+
+predictors_T <- names(lv)
+
+cat("T_Any sample (all raw consumers):   ", nrow(data_T_RRP), "\n")
+cat("T_Exclusive sample (exclusive only):", nrow(data_T_Ronly), "\n")
+```
+
+## 2. Descriptive statistics
+
+```{r descriptives}
+summarise_cohort <- function(df, label) {
+  df %>% summarise(
+    Cohort          = label,
+    Total_N         = n(),
+    Missing_Heating = sum(is.na(heating_binary)),
+    Analyzed_n      = sum(!is.na(heating_binary)),
+    Heated_n        = sum(heating_binary == 1, na.rm = TRUE),
+    Heated_Percent  = Heated_n / Analyzed_n * 100)
+}
+
+bind_rows(
+  summarise_cohort(filter(survey_with_groups, milk_consumed == "Raw dairy milk"),
+                   "Exclusive raw milk consumers"),
+  summarise_cohort(filter(survey_with_groups,
+                          milk_consumed == "Both raw and pasteurized dairy milk"),
+                   "Mixed consumers (raw + pasteurized)")
+) %>%
+  gt() %>%
+  tab_header(title = "Consistent Thermal Treatment by Consumption Group",
+             subtitle = "Heats more than half the time or always") %>%
+  cols_label(Cohort = "Consumption group", Total_N = "Total N",
+             Missing_Heating = "Missing", Analyzed_n = "Analyzed n",
+             Heated_n = "Heats consistently", Heated_Percent = "%") %>%
+  fmt_number(columns = Heated_Percent, decimals = 1)
+```
+
+Does heating behaviour differ between the two consumption groups? Tested on the
+full five-level response, and on never-heating specifically.
+
+```{r group-comparison}
+heat_levels <- c("Never", "Less than half the time", "Approximately half the time",
+                 "More than half the time", "Always")
+
+grp <- data_T_RRP %>%
+  mutate(Group = if_else(milk_consumed == "Raw dairy milk", "Exclusive", "Mixed"),
+         raw_milk_heating = factor(raw_milk_heating, levels = heat_levels)) %>%
+  filter(!is.na(raw_milk_heating))
+
+cat("Five-level heating distribution by consumption group:\n")
+print(table(grp$Group, grp$raw_milk_heating))
+
+set.seed(2026)
+cat("\nFisher's exact (5-level) p =",
+    round(fisher.test(table(grp$Group, grp$raw_milk_heating),
+                      simulate.p.value = TRUE, B = 10000)$p.value, 4), "\n")
+
+never_tab <- table(grp$Group, grp$raw_milk_heating == "Never")
+cat("\nNever-heating by group:\n"); print(never_tab)
+cat("Fisher's exact (never vs. any heating) p =",
+    round(fisher.test(never_tab)$p.value, 4), "\n")
+```
+
+```{r prevalence-bar, fig.width=7, fig.height=5}
+ggplot(grp, aes(x = Group, fill = factor(heating_binary,
+                                         labels = c("Heats half the time or less",
+                                                    "Heats consistently")))) +
+  geom_bar(position = "fill", width = 0.6, color = "white") +
+  scale_y_continuous(labels = scales::percent_format()) +
+  scale_fill_manual(values = c("#d7191c", "#2b83ba")) +
+  labs(title = "Consistent Thermal Treatment by Consumption Group",
+       x = NULL, y = "Percentage of respondents", fill = NULL) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom", panel.grid.major.x = element_blank())
+```
+
+## 3. Ordinal analysis: five-level heating response
+
+Tested before any dichotomization. Seeding inside `fisher_p()` means the same
+variable and data always return the same p-value, so this table and the
+crosstabs below agree exactly.
+
+```{r ordinal-fisher}
+fisher_p <- function(x, y) {
+  set.seed(2026)
+  fisher.test(table(x, y), simulate.p.value = TRUE, B = 10000)$p.value
+}
+
+prep <- function(df, v) {
+  df %>%
+    filter(!is.na(.data[[v]]), raw_milk_heating %in% heat_levels) %>%
+    mutate(raw_milk_heating = factor(raw_milk_heating, levels = heat_levels)) %>%
+    droplevels()
+}
+
+ordinal_fisher <- function(df, label) {
+  lapply(predictors_T, function(v) {
+    d <- prep(df, v)
+    data.frame(Sample = label, Predictor = v, p = fisher_p(d[[v]], d$raw_milk_heating))
+  }) %>%
+    bind_rows() %>%
+    mutate(p_BH = p.adjust(p, method = "BH")) %>%
+    arrange(p)
+}
+
+bind_rows(ordinal_fisher(data_T_RRP,   "All raw milk consumers"),
+          ordinal_fisher(data_T_Ronly, "Exclusive raw milk consumers")) %>%
+  mutate(across(c(p, p_BH), ~ sprintf("%.3f", .x))) %>%
+  gt(groupname_col = "Sample") %>%
+  tab_header(title = "Association Between Predictors and Heating Frequency",
+             subtitle = "Five-level response; BH correction across 11 predictors per sample") %>%
+  cols_label(p = "Fisher's exact p", p_BH = "BH-adjusted p")
+```
+
+### Supplementary crosstabs
+
+```{r crosstabs}
+pred_labels <- c(
+  age_grouped            = "Age Group",
+  sex_at_birth           = "Sex at Birth",
+  region                 = "Geographic Region",
+  education_grouped      = "Education Level",
+  politics_grouped       = "Political Orientation",
+  household_risk_group   = "Cohabitation with a High-Risk Raw Milk Consumer",
+  taste_grouped          = "Perceived Taste",
+  nutrition_belief_group = "Nutrition Beliefs",
+  raw_milk_sickness      = "Perceived Illness Risk",
+  milk_safety_concern    = "H5N1 Safety Concern",
+  info_source_grouped    = "Trusted Information Source"
+)
+
+build_xtab <- function(df, title) {
+  lapply(predictors_T, function(v) {
+    d <- prep(df, v)
+    p <- fisher_p(d[[v]], d$raw_milk_heating)
+    d %>%
+      count(Level = .data[[v]], raw_milk_heating, .drop = FALSE) %>%
+      group_by(Level) %>%
+      mutate(N = sum(n),
+             cell = ifelse(N == 0, "—", sprintf("%d (%.1f%%)", n, 100 * n / N))) %>%
+      ungroup() %>%
+      select(Level, N, raw_milk_heating, cell) %>%
+      pivot_wider(names_from = raw_milk_heating, values_from = cell) %>%
+      mutate(Level = as.character(Level),
+             Variable = paste0(pred_labels[[v]], " (p = ", sprintf("%.3f", p), ")"),
+             .before = 1)
+  }) %>%
+    bind_rows() %>%
+    gt(groupname_col = "Variable") %>%
+    tab_header(title = title,
+               subtitle = "Row percentages across heating frequency categories") %>%
+    cols_label(Level = "", N = "n") %>%
+    tab_options(table.font.size = "11px", row_group.background.color = "#F9F9F9",
+                data_row.padding = px(3)) %>%
+    tab_source_note(paste(
+      "P-values from Fisher's exact test with Monte Carlo simulation (10,000 replicates),",
+      "uncorrected for multiple comparisons; see the ordinal table for",
+      "Benjamini-Hochberg-adjusted values.",
+      "Reference categories are listed first within each variable."))
+}
+
+build_xtab(data_T_RRP,   "Heating Frequency by Predictor: All Raw Milk Consumers")
+build_xtab(data_T_Ronly, "Heating Frequency by Predictor: Exclusive Raw Milk Consumers")
+```
+
+### Supplementary heatmaps
+
+Same content as the crosstabs above, shaded by row percentage. The fill scale is
+fixed at 0-50% so shading means the same thing in both figures and across
+variables; a count-based scale would mostly show which categories are large.
+
+```{r heatmaps, fig.width=14, fig.height=13}
+# Shorten the long H5N1 labels so rows don't crowd the plot
+short_lvl <- function(x) {
+  x <- gsub("Yes, if consuming either raw or pasteurized milk", "Yes, raw or pasteurized", x, fixed = TRUE)
+  x <- gsub("Yes, if consuming pasteurized milk", "Yes, pasteurized only", x, fixed = TRUE)
+  x <- gsub("Yes, if consuming raw milk",         "Yes, raw only",         x, fixed = TRUE)
+  x
+}
+
+build_heat <- function(df, title, subtitle, outfile) {
+  dat <- lapply(predictors_T, function(v) {
+    d <- prep(df, v)
+    p <- fisher_p(d[[v]], d$raw_milk_heating)
+    d %>%
+      count(Level = .data[[v]], raw_milk_heating, .drop = FALSE) %>%
+      group_by(Level) %>%
+      mutate(N = sum(n), pct = 100 * n / N) %>%
+      ungroup() %>%
+      mutate(Variable  = sprintf("%s\n(p = %.3f)", pred_labels[[v]], p),
+             var_order = match(v, predictors_T),
+             lvl_order = as.integer(factor(Level, levels = levels(d[[v]]))))
+  }) %>% bind_rows()
+
+  dat <- dat %>%
+    mutate(Variable = factor(Variable, levels = unique(Variable[order(var_order)])),
+           Label    = sprintf("%s (n = %d)", short_lvl(as.character(Level)), N))
+
+  lvl_levels <- dat %>%
+    distinct(Variable, Label, var_order, lvl_order) %>%
+    arrange(desc(var_order), desc(lvl_order)) %>%
+    pull(Label)
+  dat$Label <- factor(dat$Label, levels = unique(lvl_levels))
+
+  gg <- ggplot(dat, aes(x = raw_milk_heating, y = Label, fill = pct)) +
+    geom_tile(color = "white", linewidth = 0.5) +
+    geom_text(aes(label = sprintf("%d (%.0f%%)", n, pct), color = pct > 30),
+              size = 3.6, family = "Times New Roman") +
+    facet_grid(Variable ~ ., scales = "free_y", space = "free_y", switch = "y") +
+    scale_fill_gradient(low = "white", high = "#08519C", limits = c(0, 50),
+                        oob = scales::squish, name = "% of row") +
+    scale_color_manual(values = c(`TRUE` = "white", `FALSE` = "grey20"), guide = "none") +
+    scale_x_discrete(labels = function(x) str_wrap(x, 12), position = "top") +
+    labs(title = title, subtitle = subtitle, x = NULL, y = NULL) +
+    theme_minimal(base_size = 13, base_family = "Times New Roman") +
+    theme(
+      strip.placement   = "outside",
+      strip.text.y.left = element_text(angle = 0, face = "bold", hjust = 1,
+                                       size = 11, lineheight = 0.9),
+      panel.grid        = element_blank(),
+      panel.spacing     = unit(0.35, "lines"),
+      axis.text.x.top   = element_text(size = 11, face = "bold"),
+      axis.text.y       = element_text(size = 10.5),
+      plot.title        = element_text(face = "bold", size = 15, hjust = 0),
+      plot.subtitle     = element_text(size = 11, color = "grey30", hjust = 0),
+      legend.position   = "bottom",
+      legend.key.width  = unit(1.6, "cm"),
+      legend.text       = element_text(size = 10),
+      legend.title      = element_text(size = 11))
+
+  ggsave(outfile, gg, width = 14, height = 13, dpi = 300)
+  gg
+}
+
+print(build_heat(data_T_RRP,
+  paste0("Heating Frequency by Predictor: All Raw Milk Consumers (n = ", nrow(data_T_RRP), ")"),
+  "Cell values are n (row %); shading reflects row percentage",
+  "Heatmap_Heating_AllRaw.png"))
+
+print(build_heat(data_T_Ronly,
+  paste0("Heating Frequency by Predictor: Exclusive Raw Milk Consumers (n = ", nrow(data_T_Ronly), ")"),
+  "Cell values are n (row %); shading reflects row percentage",
+  "Heatmap_Heating_Exclusive.png"))
+```
+
+## 4. Univariable screening on the dichotomized outcome
+
+`heating_binary` is 1 for "more than half the time" or "always". That threshold
+was chosen because infrequent heating still means regular consumption of
+unheated raw milk.
+
+```{r screening}
+screen_uv <- function(df, label) {
+  lapply(predictors_T, function(v) {
+    d <- df %>% filter(!is.na(heating_binary), !is.na(.data[[v]])) %>% droplevels()
+    if (length(unique(d[[v]])) < 2) return(data.frame(Sample = label, Predictor = v,
+                                                      n = nrow(d), min_p = NA_real_))
+    m <- glm(as.formula(paste("heating_binary ~", v)), data = d, family = binomial)
+    data.frame(Sample = label, Predictor = v, n = length(m$y),
+               min_p = min(tidy(m)$p.value[-1], na.rm = TRUE))
+  }) %>%
+    bind_rows() %>%
+    mutate(carry_forward = !is.na(min_p) & min_p < 0.10) %>%
+    arrange(min_p)
+}
+
+screen_comb <- screen_uv(data_T_RRP,   "T_Any (all raw consumers)")
+screen_excl <- screen_uv(data_T_Ronly, "T_Exclusive (exclusive consumers)")
+
+bind_rows(screen_comb, screen_excl) %>%
+  mutate(min_p = sprintf("%.4f", min_p),
+         carry_forward = ifelse(carry_forward, "Yes", "No")) %>%
+  gt(groupname_col = "Sample") %>%
+  tab_header(title = "Univariable Screening on the Dichotomized Outcome",
+             subtitle = "Predictors with p < 0.10 are carried forward") %>%
+  cols_label(min_p = "Smallest p", carry_forward = "Carried forward")
+
+comb_survivors <- screen_comb$Predictor[screen_comb$carry_forward]
+excl_survivors <- screen_excl$Predictor[screen_excl$carry_forward]
+```
+
+## 5. Forward stepwise selection
+
+```{r stepwise}
+get_aic_candidates <- function(base_formula, predictors, data) {
+  base_aic <- AIC(glm(as.formula(base_formula), data = data, family = binomial))
+  tab <- lapply(predictors, function(p) {
+    m <- glm(as.formula(paste(base_formula, "+", p)), data = data, family = binomial)
+    data.frame(Predictor = p, AIC = AIC(m))
+  }) %>% bind_rows() %>% arrange(AIC)
+  list(base_aic = base_aic, aic_table = tab)
+}
+
+run_stepwise <- function(df, candidates, label) {
+  cat("\n########", label, "########\n")
+  if (length(candidates) == 0) {
+    cat("No predictors survived screening.\n")
+    return(character(0))
+  }
+  selected <- character(0)
+  step_num <- 1
+  repeat {
+    base_f <- paste("heating_binary ~",
+                    if (length(selected) == 0) "1" else paste(selected, collapse = " + "))
+    remaining <- setdiff(candidates, selected)
+    if (length(remaining) == 0) break
+
+    res <- get_aic_candidates(base_f, remaining, df)
+    cat("\n=== Step", step_num, "=== base AIC:", round(res$base_aic, 2), "\n")
+    print(res$aic_table)
+
+    if (res$base_aic - res$aic_table$AIC[1] < 2) {
+      cat("\nNo further improvement >= 2 AIC units. Selection complete.\n")
+      break
+    }
+    selected <- c(selected, res$aic_table$Predictor[1])
+    step_num <- step_num + 1
+  }
+  cat("\nSelected:", paste(selected, collapse = ", "), "\n")
+  selected
+}
+
+sel_comb <- run_stepwise(data_T_RRP,   comb_survivors, "T_Any (all raw consumers)")
+sel_excl <- run_stepwise(data_T_Ronly, excl_survivors, "T_Exclusive (exclusive consumers)")
+```
+
+## 6. Final models
+
+```{r final-models}
+fit_final <- function(df, selected, label) {
+  if (length(selected) == 0) return(NULL)
+  m <- glm(as.formula(paste("heating_binary ~", paste(selected, collapse = " + "))),
+           data = df, family = binomial)
+  list(model = m, label = label)
+}
+
+model_T_any  <- fit_final(data_T_RRP,   sel_comb, "T_Any")
+model_T_excl <- fit_final(data_T_Ronly, sel_excl, "T_Exclusive")
+
+report_model <- function(fit) {
+  if (is.null(fit)) return(NULL)
+  tidy(fit$model, exponentiate = TRUE, conf.int = TRUE) %>%
+    filter(term != "(Intercept)") %>%
+    mutate(Model = fit$label, n = length(fit$model$y),
+           estimable = estimate < 1000 & estimate > 0.001 &
+                       !is.na(conf.low) & !is.na(conf.high),
+           OR_CI = ifelse(estimable,
+                          sprintf("%.2f (%.2f–%.2f)", estimate, conf.low, conf.high),
+                          "Not estimable"),
+           p_fmt = case_when(!estimable ~ "—",
+                             p.value < 0.001 ~ "<0.001",
+                             TRUE ~ sprintf("%.3f", p.value))) %>%
+    select(Model, n, term, OR_CI, p_fmt)
+}
+
+bind_rows(report_model(model_T_any), report_model(model_T_excl)) %>%
+  gt(groupname_col = "Model") %>%
+  tab_header(title = "Final Models: Consistent Thermal Treatment",
+             subtitle = "Predictors selected by univariable screening and forward stepwise AIC") %>%
+  cols_label(term = "Predictor", OR_CI = "OR (95% CI)", p_fmt = "p-value") %>%
+  tab_source_note(paste(
+    "References: High school or less, Democrat, Equal taste preference,",
+    "Equal nutrition beliefs. Model n excludes respondents missing a retained predictor."))
+```
+
+```{r diagnostics}
+# Hosmer-Lemeshow uses g = 5 given the small samples. A model with a single
+# categorical predictor yields fewer distinct fitted probabilities than the test
+# needs, in which case it returns df = 0 and the result is reported as not
+# applicable rather than as a p-value.
+diag_model <- function(fit) {
+  if (is.null(fit)) return(NULL)
+  m <- fit$model
+  roc_obj <- roc(m$y, fitted(m), quiet = TRUE)
+  hl <- suppressWarnings(hoslem.test(m$y, fitted(m), g = 5))
+  applicable <- as.numeric(hl$parameter) > 0
+  data.frame(
+    Model = fit$label,
+    n = length(m$y),
+    Predictors = paste(attr(terms(m), "term.labels"), collapse = " + "),
+    AUC = round(as.numeric(auc(roc_obj)), 3),
+    HL = if (applicable)
+           sprintf("X2 = %.2f, df = %d, p = %.3f",
+                   as.numeric(hl$statistic), as.numeric(hl$parameter), hl$p.value)
+         else "Not applicable (too few distinct fitted probabilities)"
+  )
+}
+
+bind_rows(diag_model(model_T_any), diag_model(model_T_excl)) %>%
+  gt() %>%
+  tab_header(title = "Thermal Treatment Model Diagnostics") %>%
+  cols_label(HL = "Hosmer-Lemeshow (g = 5)")
+```
+
+## 7. Sensitivity: alternative outcome definitions
+
+The dichotomization is varied two ways: heating at least half the time, and any
+heating versus never. Predictors are whatever the stepwise selected for each
+sample, so this tests the finding rather than a fixed variable.
+
+```{r sensitivity}
+add_heating_defs <- function(df) {
+  df %>% mutate(
+    heat_primary = heating_binary,
+    heat_halfin = case_when(
+      raw_milk_heating %in% c("Always", "More than half the time",
+                              "Approximately half the time") ~ 1,
+      raw_milk_heating %in% c("Never", "Less than half the time") ~ 0,
+      TRUE ~ NA_real_),
+    heat_ever = case_when(
+      raw_milk_heating == "Never" ~ 0,
+      raw_milk_heating %in% heat_levels ~ 1,
+      TRUE ~ NA_real_))
+}
+
+sens_RRP   <- add_heating_defs(data_T_RRP)
+sens_Ronly <- add_heating_defs(data_T_Ronly)
+
+bind_rows(
+  sens_Ronly %>% summarise(across(c(heat_primary, heat_halfin, heat_ever),
+    ~ sprintf("%d/%d (%.1f%%)", sum(.x == 1, na.rm = TRUE), sum(!is.na(.x)),
+              100 * mean(.x, na.rm = TRUE)))) %>% mutate(Sample = "T_Exclusive"),
+  sens_RRP %>% summarise(across(c(heat_primary, heat_halfin, heat_ever),
+    ~ sprintf("%d/%d (%.1f%%)", sum(.x == 1, na.rm = TRUE), sum(!is.na(.x)),
+              100 * mean(.x, na.rm = TRUE)))) %>% mutate(Sample = "T_Any")
+) %>%
+  select(Sample, everything()) %>%
+  gt() %>%
+  tab_header(title = "Prevalence Under Three Outcome Definitions",
+             subtitle = "Heaters / total (%)") %>%
+  cols_label(heat_primary = "Primary (> half)",
+             heat_halfin  = "At least half",
+             heat_ever    = "Any vs. never")
+```
+
+```{r sensitivity-models}
+fit_def <- function(df, outcome, selected, sample_label, def_label) {
+  if (length(selected) == 0) return(NULL)
+  m <- glm(as.formula(paste(outcome, "~", paste(selected, collapse = " + "))),
+           data = df, family = binomial)
+  tidy(m, exponentiate = TRUE, conf.int = TRUE) %>%
+    filter(term != "(Intercept)") %>%
+    mutate(Sample = sample_label, Definition = def_label, n = length(m$y),
+           # Complete separation inflates estimates; report as not estimable
+           estimable = estimate < 1000 & estimate > 0.001 &
+                       !is.na(conf.low) & !is.na(conf.high),
+           OR_CI = ifelse(estimable,
+                          sprintf("%.2f (%.2f–%.2f)", estimate, conf.low, conf.high),
+                          "Not estimable"),
+           p_fmt = case_when(!estimable ~ "—",
+                             p.value < 0.001 ~ "<0.001",
+                             TRUE ~ sprintf("%.3f", p.value))) %>%
+    select(Sample, Definition, n, term, OR_CI, p_fmt)
+}
+
+bind_rows(
+  fit_def(sens_RRP,   "heat_primary", sel_comb, "T_Any",       "Primary (> half)"),
+  fit_def(sens_RRP,   "heat_halfin",  sel_comb, "T_Any",       "At least half"),
+  fit_def(sens_RRP,   "heat_ever",    sel_comb, "T_Any",       "Any vs. never"),
+  fit_def(sens_Ronly, "heat_primary", sel_excl, "T_Exclusive", "Primary (> half)"),
+  fit_def(sens_Ronly, "heat_halfin",  sel_excl, "T_Exclusive", "At least half"),
+  fit_def(sens_Ronly, "heat_ever",    sel_excl, "T_Exclusive", "Any vs. never")
+) %>%
+  gt(groupname_col = "Sample") %>%
+  tab_header(title = "Sensitivity Analysis: Selected Predictors Across Outcome Definitions",
+             subtitle = "Same predictors refit under each dichotomization") %>%
+  cols_label(Definition = "Outcome definition", term = "Predictor",
+             OR_CI = "OR (95% CI)", p_fmt = "p-value")
+```
